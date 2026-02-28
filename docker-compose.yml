@@ -21,9 +21,9 @@ services:
       # Seconds to wait for each Tor instance to bootstrap before continuing.
       TOR_BOOTSTRAP_TIMEOUT: "120"
       # Time to wait for a free Tor instance before returning 503.
-      LEASE_TIMEOUT: "30s"
+      LEASE_TIMEOUT: "30"
       # Timeout for dialling upstream through Tor (Tor circuits can be slow).
-      DIAL_TIMEOUT: "120s"
+      DIAL_TIMEOUT: "120"
       # How often each Tor instance is given a new circuit (SIGNAL NEWNYM), in seconds.
       # A shorter interval rotates exit IPs more frequently.
       TOR_CIRCUIT_ROTATION_INTERVAL: "30"

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,8 +18,8 @@ const (
 	defaultManifestPath             = "/run/tor-proxy/manifest.json"
 	defaultProxyPort                = "8080"
 	defaultWebUIPort                = "8088"
-	defaultLeaseTimeout             = "30s"
-	defaultDialTimeout              = "120s" // Tor circuits can take a while to establish
+	defaultLeaseTimeout             = "30"
+	defaultDialTimeout              = "120" // Tor circuits can take a while to establish
 	defaultCtrlBasePort             = "10050" // base Tor control port; 0 = disable rotation
 	defaultCircuitRotationInterval  = "30"    // how often to rotate circuits via SIGNAL NEWNYM (seconds)
 	defaultCircuitWarmup            = "5"     // how long to hold a slot back after NEWNYM while new circuit builds (seconds); 0 = disabled
@@ -164,6 +165,11 @@ func env(key, fallback string) string {
 
 func mustDuration(key, fallback string) time.Duration {
 	raw := env(key, fallback)
+	// Accept plain integers as seconds (e.g. "30" == "30s") for consistency
+	// with other numeric env vars like TOR_CIRCUIT_ROTATION_INTERVAL.
+	if n, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil {
+		return time.Duration(n) * time.Second
+	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
 		panic(fmt.Sprintf("invalid duration for %s=%q: %v", key, raw, err))
