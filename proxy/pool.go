@@ -33,6 +33,10 @@ type TunnelSlot struct {
 	// Updated atomically by the proxy to track cumulative traffic.
 	TxBytes int64
 	RxBytes int64
+
+	// Health and circuit-ready state (protected by pool mutex).
+	Healthy bool // false when SOCKS health probe fails; slot is skipped in Acquire
+	Warming bool // true briefly after SIGNAL NEWNYM while new circuit builds
 }
 
 // LeaseInfo is a safe point-in-time snapshot of a slot (copied under the lock).
@@ -45,6 +49,8 @@ type LeaseInfo struct {
 	LastUsed   time.Time
 	TxBytes    int64
 	RxBytes    int64
+	Healthy    bool
+	Warming    bool
 }
 
 // LeasePool manages exclusive assignment of Tor instances to proxy clients.
@@ -70,6 +76,7 @@ func NewLeasePool(ifaces []InterfaceInfo, timeout time.Duration) *LeasePool {
 			Index:     i,
 			Interface: iface.Interface,
 			Address:   iface.Address,
+			Healthy:   true, // assumed healthy until first probe fails
 		})
 	}
 	return p
@@ -116,7 +123,7 @@ func (p *LeasePool) Acquire(ctx context.Context, clientAddr string) (*TunnelSlot
 		for i := 0; i < n; i++ {
 			idx := (p.next + i) % n
 			slot := p.slots[idx]
-			if slot.status == TunnelFree {
+			if slot.status == TunnelFree && slot.Healthy && !slot.Warming {
 				slot.status = TunnelBusy
 				slot.clientAddr = clientAddr
 				slot.leaseStart = time.Now()
@@ -142,6 +149,32 @@ func (p *LeasePool) Release(slot *TunnelSlot) {
 	p.cond.Broadcast()
 }
 
+// MarkHealthy updates the health state of the slot at idx.
+// Marking healthy broadcasts to wake any Acquire callers waiting for a free slot.
+func (p *LeasePool) MarkHealthy(idx int, healthy bool) {
+	p.mu.Lock()
+	if idx >= 0 && idx < len(p.slots) {
+		p.slots[idx].Healthy = healthy
+	}
+	p.mu.Unlock()
+	if healthy {
+		p.cond.Broadcast()
+	}
+}
+
+// SetWarming marks or clears the warming-up state of the slot at idx.
+// When cleared, broadcasts to wake Acquire callers waiting for a usable slot.
+func (p *LeasePool) SetWarming(idx int, warming bool) {
+	p.mu.Lock()
+	if idx >= 0 && idx < len(p.slots) {
+		p.slots[idx].Warming = warming
+	}
+	p.mu.Unlock()
+	if !warming {
+		p.cond.Broadcast()
+	}
+}
+
 // Snapshots returns a point-in-time view of all slots (safe to read without
 // holding the lock by copying under it). Byte counters are read atomically.
 func (p *LeasePool) Snapshots() []LeaseInfo {
@@ -158,6 +191,8 @@ func (p *LeasePool) Snapshots() []LeaseInfo {
 			LastUsed:   s.lastUsed,
 			TxBytes:    atomic.LoadInt64(&s.TxBytes),
 			RxBytes:    atomic.LoadInt64(&s.RxBytes),
+			Healthy:    s.Healthy,
+			Warming:    s.Warming,
 		}
 	}
 	return out

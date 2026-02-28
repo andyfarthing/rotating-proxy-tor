@@ -31,6 +31,7 @@ type TorInstanceStats struct {
 	LastUsed    time.Time // last time this slot was released
 	TxBytes     int64     // bytes sent through this instance (cumulative)
 	RxBytes     int64     // bytes received through this instance (cumulative)
+	LastNewnym  time.Time // when SIGNAL NEWNYM was last sent to this instance
 }
 
 // TorStats is the full stats snapshot served by the web UI.
@@ -44,19 +45,35 @@ type TorStats struct {
 // each Get() call, so there is no periodic cache to keep in sync.
 type StatsCollector struct {
 	pool       *LeasePool
-	ctrlBase   int      // base control port for SIGNAL NEWNYM; 0 = rotation disabled
-	exitIPs    sync.Map // key: slot index (int) → value: string IP
-	ipCheckURL string   // URL of an IP-echo service reachable through Tor
+	ctrlBase   int          // base control port for SIGNAL NEWNYM; 0 = rotation disabled
+	exitIPs    sync.Map     // key: slot index (int) → value: string IP
+	ipCheckURL string       // URL of an IP-echo service reachable through Tor
+	newnymMu   sync.Mutex
+	lastNewnym []time.Time  // indexed by slot; when SIGNAL NEWNYM was last sent
+	warmup     time.Duration // hold-off after NEWNYM before slot re-enters pool (0 = disabled)
 }
 
-// NewStatsCollector initialises the collector and kicks off an initial exit IP
-// resolution shortly after startup.
-// ctrlBase is the base Tor control port used for SIGNAL NEWNYM circuit rotation.
-// Pass 0 to disable rotation. ipCheckURL is the URL of a plain-text IP-echo
-// service (e.g. https://api.ipify.org) reachable through Tor; pass an empty
-// string to disable exit IP display.
-func NewStatsCollector(pool *LeasePool, ctrlBase int, ipCheckURL string) *StatsCollector {
-	sc := &StatsCollector{pool: pool, ctrlBase: ctrlBase, ipCheckURL: ipCheckURL}
+// NewStatsCollector initialises the collector, starts a SOCKS health probe, and
+// kicks off an initial exit IP resolution shortly after startup.
+// ctrlBase: base Tor control port for SIGNAL NEWNYM rotation; 0 to disable.
+// ipCheckURL: plain-text IP-echo service reachable through Tor; "" to disable exit IP display.
+// warmup: how long to mark a slot as unavailable after NEWNYM while the new circuit builds; 0 to disable.
+func NewStatsCollector(pool *LeasePool, ctrlBase int, ipCheckURL string, warmup time.Duration) *StatsCollector {
+	n := len(pool.slots)
+	now := time.Now()
+	initial := make([]time.Time, n)
+	for i := range initial {
+		initial[i] = now
+	}
+	sc := &StatsCollector{
+		pool:       pool,
+		ctrlBase:   ctrlBase,
+		ipCheckURL: ipCheckURL,
+		warmup:     warmup,
+		lastNewnym: initial,
+	}
+	// Start periodic SOCKS health probe.
+	go sc.runHealthProbe()
 	// Populate exit IPs shortly after startup (circuits need a few seconds to build).
 	if ipCheckURL != "" {
 		go func() {
@@ -68,7 +85,7 @@ func NewStatsCollector(pool *LeasePool, ctrlBase int, ipCheckURL string) *StatsC
 }
 
 // Get builds a fresh TorStats snapshot on every call. All fields except
-// ExitAddress come directly from live pool state (no caching lag).
+// ExitAddress and LastNewnym come directly from live pool state (no caching lag).
 func (sc *StatsCollector) Get() TorStats {
 	snaps := sc.pool.Snapshots()
 	stats := make([]TorInstanceStats, len(snaps))
@@ -83,6 +100,11 @@ func (sc *StatsCollector) Get() TorStats {
 		if ip, ok := sc.exitIPs.Load(i); ok {
 			inst.ExitAddress = ip.(string)
 		}
+		sc.newnymMu.Lock()
+		if i < len(sc.lastNewnym) {
+			inst.LastNewnym = sc.lastNewnym[i]
+		}
+		sc.newnymMu.Unlock()
 		stats[i] = inst
 	}
 	return TorStats{
@@ -180,6 +202,21 @@ func (sc *StatsCollector) StartCircuitRotation(interval time.Duration) {
 					failed++
 				} else {
 					rotated++
+					// Record the rotation time for circuit age display.
+					sc.newnymMu.Lock()
+					if i < len(sc.lastNewnym) {
+						sc.lastNewnym[i] = time.Now()
+					}
+					sc.newnymMu.Unlock()
+					// Mark the slot as warming so new requests don't use a half-built circuit.
+					if sc.warmup > 0 {
+						sc.pool.SetWarming(i, true)
+						idx := i
+						go func() {
+							time.Sleep(sc.warmup)
+							sc.pool.SetWarming(idx, false)
+						}()
+					}
 				}
 			}
 			slog.Info("circuits rotated", "ok", rotated, "failed", failed)
@@ -233,6 +270,34 @@ func sendNewnym(ctrlAddr string) error {
 		return err
 	}
 	return fmt.Errorf("no response to SIGNAL NEWNYM")
+}
+
+// runHealthProbe periodically checks whether each Tor instance's SOCKS port
+// is reachable and updates the pool's health state accordingly. Unhealthy
+// slots are skipped by Acquire until they recover.
+func (sc *StatsCollector) runHealthProbe() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		n := len(sc.pool.slots)
+		for i := 0; i < n; i++ {
+			addr := sc.pool.slots[i].Address
+			wasHealthy := sc.pool.slots[i].Healthy // safe to read — approximate
+			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+			if err != nil {
+				if wasHealthy {
+					slog.Warn("tor instance unreachable", "instance", i, "addr", addr, "err", err)
+				}
+				sc.pool.MarkHealthy(i, false)
+			} else {
+				conn.Close()
+				if !wasHealthy {
+					slog.Info("tor instance recovered", "instance", i, "addr", addr)
+				}
+				sc.pool.MarkHealthy(i, true)
+			}
+		}
+	}
 }
 
 // logTorStats logs a summary of Tor instance stats at INFO level.

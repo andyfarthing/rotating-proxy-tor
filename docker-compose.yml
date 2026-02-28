@@ -27,6 +27,10 @@ services:
       # How often each Tor instance is given a new circuit (SIGNAL NEWNYM), in seconds.
       # A shorter interval rotates exit IPs more frequently.
       TOR_CIRCUIT_ROTATION_INTERVAL: "30"
+      # Seconds to hold a slot back after SIGNAL NEWNYM while the new circuit builds.
+      # During this window the slot shows as "warming" in the web UI and is skipped
+      # by the proxy. Set to 0 to disable (slots return immediately after rotation).
+      TOR_CIRCUIT_WARMUP: "5"
       # URL of a plain-text IP-echo service used to determine each instance's exit IP.
       # Must be reachable through Tor. Set to empty string to disable exit IP display.
       TOR_IP_CHECK_URL: "https://api.ipify.org"

@@ -30,15 +30,16 @@ type StatusResponse struct {
 
 // TunnelStatusEntry combines lease pool state with Tor instance telemetry.
 type TunnelStatusEntry struct {
-	Interface       string    `json:"interface"`
-	Address         string    `json:"address"`
-	Status          string    `json:"status"` // "free" | "busy"
-	ClientAddr      string    `json:"client_addr,omitempty"`
-	LeaseDuration   string    `json:"lease_duration,omitempty"`
-	PeerEndpoint    string    `json:"peer_endpoint,omitempty"`
-	LatestHandshake string    `json:"latest_handshake,omitempty"`
-	TxBytes         int64     `json:"tx_bytes"`
-	RxBytes         int64     `json:"rx_bytes"`
+	Interface       string `json:"interface"`
+	Address         string `json:"address"`
+	Status          string `json:"status"` // "free" | "busy" | "warming" | "degraded"
+	ClientAddr      string `json:"client_addr,omitempty"`
+	LeaseDuration   string `json:"lease_duration,omitempty"`
+	PeerEndpoint    string `json:"peer_endpoint,omitempty"`
+	LatestHandshake string `json:"latest_handshake,omitempty"`
+	LastNewnym      string `json:"last_newnym,omitempty"` // RFC3339 timestamp of last SIGNAL NEWNYM
+	TxBytes         int64  `json:"tx_bytes"`
+	RxBytes         int64  `json:"rx_bytes"`
 }
 
 func (h *webUIHandler) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -62,13 +63,18 @@ func (h *webUIHandler) handleStatus(w http.ResponseWriter, r *http.Request) {
 			Address:   lease.Address,
 		}
 
-		if lease.Status == TunnelBusy {
+		switch {
+		case !lease.Healthy:
+			entry.Status = "degraded"
+		case lease.Warming:
+			entry.Status = "warming"
+		case lease.Status == TunnelBusy:
 			entry.Status = "busy"
 			entry.ClientAddr = lease.ClientAddr
 			if !lease.LeaseStart.IsZero() {
 				entry.LeaseDuration = time.Since(lease.LeaseStart).Round(time.Millisecond).String()
 			}
-		} else {
+		default:
 			entry.Status = "free"
 		}
 
@@ -82,8 +88,11 @@ func (h *webUIHandler) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if inst, ok := instByIface[lease.Interface]; ok {
-			// PeerEndpoint repurposed as exit node IP (queried via Tor control port).
+			// PeerEndpoint repurposed as exit node IP.
 			entry.PeerEndpoint = inst.ExitAddress
+			if !inst.LastNewnym.IsZero() {
+				entry.LastNewnym = inst.LastNewnym.Format(time.RFC3339)
+			}
 		}
 
 		response.Tunnels[i] = entry
@@ -145,6 +154,8 @@ const uiHTML = `<!DOCTYPE html>
   .badge{display:inline-block;padding:.2em .6em;border-radius:999px;font-size:.75rem;font-weight:600}
   .free{background:#14532d;color:#86efac}
   .busy{background:#7c2d12;color:#fca5a5}
+  .warming{background:#713f12;color:#fde68a}
+  .degraded{background:#1e293b;color:#94a3b8}
   .iface{font-family:monospace;font-weight:700;color:#93c5fd}
   .addr{font-family:monospace;color:#a5b4fc}
   .endpoint{font-family:monospace;font-size:.8rem;color:#67e8f9}
@@ -162,12 +173,13 @@ const uiHTML = `<!DOCTYPE html>
   <th>SOCKS Address</th>
   <th>Status</th>
   <th>Exit Node</th>
+  <th>Circuit Age</th>
   <th>Last Used</th>
   <th>↑ Sent</th>
   <th>↓ Received</th>
   <th>Current Client</th>
 </tr></thead>
-<tbody id="tbody"><tr><td colspan="8" style="text-align:center;padding:2rem;color:#64748b">Loading…</td></tr></tbody>
+<tbody id="tbody"><tr><td colspan="9" style="text-align:center;padding:2rem;color:#64748b">Loading…</td></tr></tbody>
 </table>
 <div class="footer">Auto-refreshes every second &bull; <a href="/api/status" style="color:#475569">JSON API</a></div>
 
@@ -197,13 +209,14 @@ async function refresh(){
         '<td><span class="addr">'+(t.address||'—')+'</span></td>'+
         '<td><span class="badge '+t.status+'">'+t.status+'</span></td>'+
         '<td><span class="endpoint">'+(t.peer_endpoint||'—')+'</span></td>'+
+        '<td><span class="ts">'+ago(t.last_newnym)+'</span></td>'+
         '<td><span class="ts">'+ago(t.latest_handshake)+'</span></td>'+
         '<td><span class="bytes">'+fmt(t.tx_bytes)+'</span></td>'+
         '<td><span class="bytes">'+fmt(t.rx_bytes)+'</span></td>'+
-        '<td><span class="client">'+(t.client_addr||(t.lease_duration?t.lease_duration:'—'))+'</span></td>'+
+        '<td><span class="client">'+(t.client_addr||(t.lease_duration?t.lease_duration:'\u2014'))+'</span></td>'+
         '</tr>';
     }).join('');
-    document.getElementById('tbody').innerHTML=rows||'<tr><td colspan="8" style="text-align:center;padding:2rem;color:#64748b">No tunnels active</td></tr>';
+    document.getElementById('tbody').innerHTML=rows||'<tr><td colspan="9" style="text-align:center;padding:2rem;color:#64748b">No tunnels active</td></tr>';
   }catch(e){console.error(e)}
 }
 refresh();

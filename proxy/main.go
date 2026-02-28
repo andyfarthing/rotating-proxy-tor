@@ -21,6 +21,7 @@ const (
 	defaultDialTimeout              = "120s" // Tor circuits can take a while to establish
 	defaultCtrlBasePort             = "10050" // base Tor control port; 0 = disable rotation
 	defaultCircuitRotationInterval  = "30"    // how often to rotate circuits via SIGNAL NEWNYM (seconds)
+	defaultCircuitWarmup            = "5"     // how long to hold a slot back after NEWNYM while new circuit builds (seconds); 0 = disabled
 	defaultIPCheckURL               = "https://api.ipify.org" // plain-text IP-echo service used to determine exit IPs
 )
 
@@ -34,6 +35,7 @@ func main() {
 	dialTimeout   := mustDuration("DIAL_TIMEOUT",   defaultDialTimeout)
 	ctrlBasePort        := mustInt("TOR_CTRL_BASE_PORT",            defaultCtrlBasePort)
 	circuitRotInterval  := time.Duration(mustInt("TOR_CIRCUIT_ROTATION_INTERVAL", defaultCircuitRotationInterval)) * time.Second
+	circuitWarmup       := time.Duration(mustInt("TOR_CIRCUIT_WARMUP",            defaultCircuitWarmup)) * time.Second
 	ipCheckURL          := env("TOR_IP_CHECK_URL", defaultIPCheckURL)
 
 	// Read the manifest written by entrypoint.sh (Tor SOCKS addresses).
@@ -48,8 +50,8 @@ func main() {
 		slog.Info("  tor instance", "name", iface.Interface, "socks", iface.Address)
 	}
 
-	pool := NewLeasePool(ifaces, leaseTimeout)
-	sc   := NewStatsCollector(pool, ctrlBasePort, ipCheckURL)
+	pool  := NewLeasePool(ifaces, leaseTimeout)
+	sc    := NewStatsCollector(pool, ctrlBasePort, ipCheckURL, circuitWarmup)
 	sc.StartCircuitRotation(circuitRotInterval)
 
 	// --- Proxy server ---
@@ -57,9 +59,10 @@ func main() {
 	// Go 1.22+ ServeMux rewrites/redirects requests whose URL doesn't look like
 	// a normal path, which breaks HTTP CONNECT requests (e.g. CONNECT host:443)
 	// by responding with 301 instead of forwarding them to the handler.
+	proxyH := &proxyHandler{pool: pool, timeout: dialTimeout}
 	proxySrv := &http.Server{
 		Addr:    ":" + proxyPort,
-		Handler: &proxyHandler{pool: pool, timeout: dialTimeout},
+		Handler: proxyH,
 	}
 	go func() {
 		slog.Info("proxy listening", "port", proxyPort)
@@ -95,12 +98,15 @@ func main() {
 	<-stop
 
 	slog.Info("shutting down…")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Allow up to 30s: first drain the HTTP server (non-hijacked handlers),
+	// then drain hijacked CONNECT tunnels, then shut down the web UI.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	proxySrv.Shutdown(ctx)
+	proxySrv.Shutdown(ctx)  //nolint:errcheck — best-effort
+	proxyH.Drain(ctx)        // wait for hijacked CONNECT tunnels
 	if webuiSrv != nil {
-		webuiSrv.Shutdown(ctx)
+		webuiSrv.Shutdown(ctx) //nolint:errcheck
 	}
 	slog.Info("shutdown complete")
 }

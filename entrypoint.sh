@@ -81,9 +81,9 @@ EOF
     chmod 700 "$INST_DIR"
     chown -R nobody:nobody "$INST_DIR"
 
-    # Start Tor in the background. On Alpine, the tor binary is happy running
-    # as root when DataDirectory is owned by root (default here).
+    # Start Tor in the background and save its PID for the watchdog.
     tor -f "${INST_DIR}/torrc" &
+    echo $! > "/tmp/tor_pid_${i}"
 
     i=$((i + 1))
 done
@@ -151,6 +151,35 @@ printf ']' >> "$MANIFEST_PATH"
 
 log "Manifest written to $MANIFEST_PATH"
 log "Tor setup complete. Starting proxy..."
+
+# ---------------------------------------------------------------------------
+# Background watchdog — restarts any tor process that dies unexpectedly
+# ---------------------------------------------------------------------------
+
+(
+    while true; do
+        sleep 30
+        j=0
+        while [ "$j" -lt "$TOR_INSTANCES" ]; do
+            PID_FILE="/tmp/tor_pid_${j}"
+            if [ -f "$PID_FILE" ]; then
+                PID=$(cat "$PID_FILE")
+                if ! kill -0 "$PID" 2>/dev/null; then
+                    log "tor${j} (PID $PID) died — restarting..."
+                    INST_DIR="${TOR_DATA_DIR}/tor${j}"
+                    LOG_FILE="${INST_DIR}/notices.log"
+                    : > "$LOG_FILE"
+                    chown nobody:nobody "$LOG_FILE" 2>/dev/null || true
+                    tor -f "${INST_DIR}/torrc" &
+                    NEW_PID=$!
+                    echo $NEW_PID > "$PID_FILE"
+                    log "tor${j} restarted with PID $NEW_PID"
+                fi
+            fi
+            j=$((j + 1))
+        done
+    done
+) &
 
 # ---------------------------------------------------------------------------
 # Exec the proxy (replaces this shell so signals propagate correctly)

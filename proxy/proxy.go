@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,8 +18,9 @@ import (
 // Tor instance leasing. Each accepted connection is assigned one Tor instance
 // for its entire lifetime, ensuring traffic isolation per client request.
 type proxyHandler struct {
-	pool    *LeasePool
-	timeout time.Duration // per-connection dial timeout
+	pool        *LeasePool
+	timeout     time.Duration // per-connection dial timeout
+	activeConns sync.WaitGroup // tracks in-flight connections for graceful drain
 }
 
 func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -33,6 +35,8 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Acquires a Tor instance, dials the target through its SOCKS5 port,
 // sends 200, then copies bidirectionally while counting bytes.
 func (h *proxyHandler) handleCONNECT(w http.ResponseWriter, r *http.Request) {
+	h.activeConns.Add(1)
+	defer h.activeConns.Done()
 	slot, err := h.pool.Acquire(r.Context(), r.RemoteAddr)
 	if err != nil {
 		slog.Warn("tor instance acquire failed", "client", r.RemoteAddr, "err", err)
@@ -77,6 +81,8 @@ func (h *proxyHandler) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 
 // handleHTTP forwards a plain HTTP request through the leased Tor instance.
 func (h *proxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	h.activeConns.Add(1)
+	defer h.activeConns.Done()
 	slot, err := h.pool.Acquire(r.Context(), r.RemoteAddr)
 	if err != nil {
 		slog.Warn("tor instance acquire failed", "client", r.RemoteAddr, "err", err)
@@ -132,6 +138,23 @@ func (h *proxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Tunnel-Interface", slot.Interface)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// Drain waits for all in-flight proxy connections to finish or ctx to expire.
+// Should be called after http.Server.Shutdown() to catch hijacked CONNECT
+// tunnels which are not tracked by the HTTP server's own drain logic.
+func (h *proxyHandler) Drain(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		h.activeConns.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		slog.Info("all proxy connections drained")
+	case <-ctx.Done():
+		slog.Warn("drain timed out; some connections may have been cut short")
+	}
 }
 
 // dialViaTor dials addr through the Tor SOCKS5 proxy at socksAddr.
