@@ -1,0 +1,44 @@
+services:
+  tor-proxy:
+    build: .
+    container_name: tor-proxy
+
+    # ── Ports ─────────────────────────────────────────────────────────────────
+    ports:
+      - "8080:8080"   # HTTP/HTTPS proxy (configure clients to use this)
+      - "8088:8088"   # Web UI (http://localhost:8088)
+
+    # ── Optional environment overrides ───────────────────────────────────────
+    environment:
+      PROXY_PORT: "8080"
+      WEB_UI_PORT: "8088"
+      # Number of Tor instances (each has a separate circuit/exit IP).
+      TOR_INSTANCES: "10"
+      # First SOCKS port; subsequent instances use +1 (9050, 9051, …, 9059).
+      TOR_BASE_SOCKS_PORT: "9050"
+      # First control port; used to query exit IPs for the web UI.
+      TOR_BASE_CTRL_PORT: "10050"
+      # Seconds to wait for each Tor instance to bootstrap before continuing.
+      TOR_BOOTSTRAP_TIMEOUT: "120"
+      # Time to wait for a free Tor instance before returning 503.
+      LEASE_TIMEOUT: "30s"
+      # Timeout for dialling upstream through Tor (Tor circuits can be slow).
+      DIAL_TIMEOUT: "120s"
+      # How often each Tor instance is given a new circuit (SIGNAL NEWNYM), in seconds.
+      # A shorter interval rotates exit IPs more frequently.
+      TOR_CIRCUIT_ROTATION_INTERVAL: "30"
+      # URL of a plain-text IP-echo service used to determine each instance's exit IP.
+      # Must be reachable through Tor. Set to empty string to disable exit IP display.
+      TOR_IP_CHECK_URL: "https://api.ipify.org"
+      # Log verbosity: debug | info | warn | error
+      LOG_LEVEL: "info"
+
+    restart: unless-stopped
+
+    # ── Resource limits ───────────────────────────────────────────────────────
+    # Each Tor process opens many file descriptors (SOCKS, control, circuits).
+    # Raise the limit to support larger instance counts (e.g. 50–100).
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
