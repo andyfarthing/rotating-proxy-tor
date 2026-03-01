@@ -23,6 +23,13 @@ MANIFEST_DIR="$(dirname "$MANIFEST_PATH")"
 TOR_EXIT_REGION="${TOR_EXIT_REGION:-}"
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+log() { printf '[entrypoint] %s\n' "$*"; }
+die() { log "ERROR: $*"; exit 1; }
+
+# ---------------------------------------------------------------------------
 # Resolve TOR_EXIT_REGION to a comma-separated list of {CC} country codes.
 # An empty region means worldwide (no restriction).
 # ---------------------------------------------------------------------------
@@ -46,13 +53,6 @@ case "$(echo "$TOR_EXIT_REGION" | tr '[:upper:]' '[:lower:'])" in
 esac
 
 [ -n "$EXIT_NODES" ] && log "Restricting exit nodes to: $EXIT_NODES"
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-log() { printf '[entrypoint] %s\n' "$*"; }
-die() { log "ERROR: $*"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Sanity checks
