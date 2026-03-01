@@ -1,0 +1,71 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # create tags and releases
+      packages: write # push to ghcr.io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history required for tag detection and release notes
+
+      # ── Versioning ────────────────────────────────────────────────────────
+      # Reads conventional commit messages since the last tag to determine
+      # the bump type:  fix: → patch  |  feat: → minor  |  BREAKING CHANGE → major
+      - name: Bump version and push tag
+        id: tag
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag_prefix: v
+          default_bump: patch
+
+      # ── Docker ───────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ghcr.io requires a lowercase image name; repository may contain uppercase.
+      - name: Normalise image name
+        id: image
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ steps.tag.outputs.new_tag }}
+            ${{ steps.image.outputs.name }}:latest
+          # Inline build cache keeps cold builds fast without an external registry.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── GitHub Release ────────────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.new_tag }}
+          generate_release_notes: true
+          body: |
+            ## Docker image
+
+            ```
+            docker pull ${{ steps.image.outputs.name }}:${{ steps.tag.outputs.new_tag }}
+            ```
