@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,6 +29,7 @@ type TorInstanceStats struct {
 	Interface   string
 	SocksAddr   string
 	ExitAddress string    // IP seen by the outside world (queried via SOCKS to an IP-echo service)
+	ExitCountry string    // ISO 3166-1 alpha-2 country code for ExitAddress (e.g. "DE")
 	LastUsed    time.Time // last time this slot was released
 	TxBytes     int64     // bytes sent through this instance (cumulative)
 	RxBytes     int64     // bytes received through this instance (cumulative)
@@ -46,8 +48,9 @@ type TorStats struct {
 type StatsCollector struct {
 	pool       *LeasePool
 	ctrlBase   int          // base control port for SIGNAL NEWNYM; 0 = rotation disabled
-	exitIPs    sync.Map     // key: slot index (int) → value: string IP
-	ipCheckURL string       // URL of an IP-echo service reachable through Tor
+	exitIPs       sync.Map  // key: slot index (int) → value: string IP
+	exitCountries sync.Map  // key: slot index (int) → value: string country code (ISO 3166-1 alpha-2)
+	ipCheckURL    string    // URL of an IP-echo service reachable through Tor
 	newnymMu   sync.Mutex
 	lastNewnym []time.Time  // indexed by slot; when SIGNAL NEWNYM was last sent
 	warmup     time.Duration // hold-off after NEWNYM before slot re-enters pool (0 = disabled)
@@ -100,6 +103,9 @@ func (sc *StatsCollector) Get() TorStats {
 		if ip, ok := sc.exitIPs.Load(i); ok {
 			inst.ExitAddress = ip.(string)
 		}
+		if cc, ok := sc.exitCountries.Load(i); ok {
+			inst.ExitCountry = cc.(string)
+		}
 		sc.newnymMu.Lock()
 		if i < len(sc.lastNewnym) {
 			inst.LastNewnym = sc.lastNewnym[i]
@@ -140,9 +146,141 @@ func (sc *StatsCollector) refreshExitIPs() {
 				return
 			}
 			sc.exitIPs.Store(idx, ip)
+			// Country lookup is decoupled: fire-and-forget so the IP is
+			// available immediately and the country fills in asynchronously.
+			go func(i int, addr string) {
+				if cc := sc.lookupExitCountry(i, addr); cc != "" {
+					sc.exitCountries.Store(i, cc)
+				}
+			}(idx, ip)
 		}(i)
 	}
 	wg.Wait()
+}
+
+// refreshExitIPForInstance queries the exit IP for a single Tor instance.
+// Used after per-instance circuit rotation so only the rotated instance is
+// re-queried rather than the entire pool.
+func (sc *StatsCollector) refreshExitIPForInstance(idx int) {
+	if sc.ipCheckURL == "" {
+		return
+	}
+	socksAddr := sc.pool.slots[idx].Address
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ip, err := queryExitAddrViaSocks(ctx, socksAddr, sc.ipCheckURL)
+	if err != nil {
+		slog.Debug("exit IP query failed", "instance", idx, "err", err)
+		return
+	}
+	sc.exitIPs.Store(idx, ip)
+	// Country lookup is decoupled: fire-and-forget so the IP is
+	// available immediately and the country fills in asynchronously.
+	go func() {
+		if cc := sc.lookupExitCountry(idx, ip); cc != "" {
+			sc.exitCountries.Store(idx, cc)
+		}
+	}()
+}
+
+// lookupExitCountry resolves the 2-letter ISO 3166-1 alpha-2 country code for
+// ip. It first queries Tor's built-in geoip database via the control port
+// (fast, no external request); if that fails it falls back to ip-api.com via
+// the instance's SOCKS5 port (one additional HTTP request through Tor).
+func (sc *StatsCollector) lookupExitCountry(idx int, ip string) string {
+	if ip == "" {
+		return ""
+	}
+	// Primary: Tor's own geoip via GETINFO ip-to-country/<ip>.
+	if sc.ctrlBase != 0 {
+		ctrlAddr := fmt.Sprintf("127.0.0.1:%d", sc.ctrlBase+idx)
+		if cc, err := queryTorCountry(ctrlAddr, ip); err == nil && cc != "" {
+			return strings.ToUpper(cc)
+		}
+	}
+	// Fallback: ip-api.com via SOCKS5 (HTTP only on free tier).
+	socksAddr := sc.pool.slots[idx].Address
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if cc, err := queryIPAPICountry(ctx, socksAddr, ip); err == nil && cc != "" {
+		return cc
+	}
+	return ""
+}
+
+// queryTorCountry queries Tor's built-in geoip database via the control port
+// (GETINFO ip-to-country/<ip>) to resolve the ISO country code for an IP.
+// This reuses the existing control-port connection and makes no external requests.
+func queryTorCountry(ctrlAddr, ip string) (string, error) {
+	conn, err := net.DialTimeout("tcp", ctrlAddr, 2*time.Second)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+
+	fmt.Fprintf(conn, "AUTHENTICATE\r\n") //nolint:errcheck
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "250") {
+			break
+		}
+		if strings.HasPrefix(line, "5") || strings.HasPrefix(line, "4") {
+			return "", fmt.Errorf("auth: %s", line)
+		}
+	}
+
+	fmt.Fprintf(conn, "GETINFO ip-to-country/%s\r\n", ip) //nolint:errcheck
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Response line looks like: 250-ip-to-country/1.2.3.4=de
+		if strings.HasPrefix(line, "250-ip-to-country/") {
+			if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
+				return strings.TrimSpace(parts[1]), nil
+			}
+		}
+		if strings.HasPrefix(line, "250 OK") {
+			break
+		}
+		if strings.HasPrefix(line, "5") || strings.HasPrefix(line, "4") {
+			return "", fmt.Errorf("GETINFO: %s", line)
+		}
+	}
+	return "", fmt.Errorf("no country data returned")
+}
+
+// queryIPAPICountry makes an HTTP request to ip-api.com through the given
+// SOCKS5 address to resolve the ISO country code for ip. Used as a fallback
+// when Tor's built-in geoip data is unavailable.
+func queryIPAPICountry(ctx context.Context, socksAddr, ip string) (string, error) {
+	d, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
+	if err != nil {
+		return "", err
+	}
+	cd, ok := d.(proxy.ContextDialer)
+	if !ok {
+		return "", fmt.Errorf("socks5 dialer does not implement ContextDialer")
+	}
+	transport := &http.Transport{DialContext: cd.DialContext}
+	client := &http.Client{Transport: transport}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://ip-api.com/json/"+ip+"?fields=countryCode", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		CountryCode string `json:"countryCode"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 256)).Decode(&result); err != nil {
+		return "", err
+	}
+	return result.CountryCode, nil
 }
 
 // queryExitAddrViaSocks makes an HTTP GET request through the given SOCKS5
@@ -178,10 +316,10 @@ func queryExitAddrViaSocks(ctx context.Context, socksAddr, ipCheckURL string) (s
 	return ip, nil
 }
 
-// StartCircuitRotation sends SIGNAL NEWNYM to every Tor control port on the
-// given interval, causing each instance to build a fresh circuit and therefore
-// present a new exit IP for subsequent connections.
-// After each rotation, exit IPs are re-queried and the web UI is updated.
+// StartCircuitRotation sends SIGNAL NEWNYM to each Tor control port on the
+// given interval, staggered evenly so that only one instance rotates at a time.
+// With n instances and a 30s interval, one rotation fires every (30/n) seconds,
+// preventing all instances from entering the "warming" state simultaneously.
 // This method is a no-op when ctrlBase is 0 (control-port queries disabled).
 func (sc *StatsCollector) StartCircuitRotation(interval time.Duration) {
 	if sc.ctrlBase == 0 {
@@ -189,47 +327,58 @@ func (sc *StatsCollector) StartCircuitRotation(interval time.Duration) {
 		return
 	}
 	n := len(sc.pool.slots)
-	slog.Info("circuit rotation enabled", "interval", interval, "instances", n)
-	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for range t.C {
-			rotated, failed := 0, 0
-			for i := 0; i < n; i++ {
-				ctrlAddr := fmt.Sprintf("127.0.0.1:%d", sc.ctrlBase+i)
-				if err := sendNewnym(ctrlAddr); err != nil {
-					slog.Warn("NEWNYM failed", "instance", i, "err", err)
-					failed++
-				} else {
-					rotated++
-					// Record the rotation time for circuit age display.
-					sc.newnymMu.Lock()
-					if i < len(sc.lastNewnym) {
-						sc.lastNewnym[i] = time.Now()
-					}
-					sc.newnymMu.Unlock()
-					// Mark the slot as warming so new requests don't use a half-built circuit.
-					if sc.warmup > 0 {
-						sc.pool.SetWarming(i, true)
-						idx := i
-						go func() {
-							time.Sleep(sc.warmup)
-							sc.pool.SetWarming(idx, false)
-						}()
-					}
-				}
-			}
-			slog.Info("circuits rotated", "ok", rotated, "failed", failed)
-			// Clear stale exit IPs then re-query once new circuits have built.
-			for i := 0; i < n; i++ {
-				sc.exitIPs.Delete(i)
-			}
+	// Spread initial offsets evenly across the full interval so that rotations
+	// are distributed rather than all firing at the same moment.
+	stagger := interval / time.Duration(n)
+	slog.Info("circuit rotation enabled",
+		"interval", interval,
+		"instances", n,
+		"stagger", stagger,
+	)
+
+	rotateOne := func(i int) {
+		ctrlAddr := fmt.Sprintf("127.0.0.1:%d", sc.ctrlBase+i)
+		if err := sendNewnym(ctrlAddr); err != nil {
+			slog.Warn("NEWNYM failed", "instance", i, "err", err)
+			return
+		}
+		slog.Debug("circuit rotated", "instance", i)
+		// Record rotation time for circuit-age display in web UI.
+		sc.newnymMu.Lock()
+		if i < len(sc.lastNewnym) {
+			sc.lastNewnym[i] = time.Now()
+		}
+		sc.newnymMu.Unlock()
+		// Hold the slot back while the new circuit builds.
+		if sc.warmup > 0 {
+			sc.pool.SetWarming(i, true)
 			go func() {
-				time.Sleep(5 * time.Second) // give Tor time to build new circuits
-				sc.refreshExitIPs()
+				time.Sleep(sc.warmup)
+				sc.pool.SetWarming(i, false)
 			}()
 		}
-	}()
+		// Clear stale exit IP and country; re-query after Tor has built the new circuit.
+		sc.exitIPs.Delete(i)
+		sc.exitCountries.Delete(i)
+		go func() {
+			time.Sleep(5 * time.Second)
+			sc.refreshExitIPForInstance(i)
+		}()
+	}
+
+	for idx := 0; idx < n; idx++ {
+		i := idx
+		go func() {
+			// Wait for this instance's initial offset so rotations are spread out.
+			time.Sleep(time.Duration(i) * stagger)
+			rotateOne(i)
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			for range t.C {
+				rotateOne(i)
+			}
+		}()
+	}
 }
 
 // sendNewnym connects to a Tor control port and sends SIGNAL NEWNYM, which
