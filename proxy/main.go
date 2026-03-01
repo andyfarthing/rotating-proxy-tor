@@ -77,7 +77,7 @@ func main() {
 	var webuiSrv *http.Server
 	if webuiPort != "0" {
 		uiMux := http.NewServeMux()
-		ui := &webUIHandler{pool: pool, stats: sc}
+		ui := &webUIHandler{pool: pool, stats: sc, exitRegion: env("TOR_EXIT_REGION", "")}
 		ui.Register(uiMux)
 		webuiSrv = &http.Server{
 			Addr:    ":" + webuiPort,

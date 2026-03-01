@@ -12,8 +12,9 @@ import (
 
 // webUIHandler serves the status web UI and JSON API.
 type webUIHandler struct {
-	pool  *LeasePool
-	stats *StatsCollector
+	pool       *LeasePool
+	stats      *StatsCollector
+	exitRegion string // value of TOR_EXIT_REGION env var (empty = worldwide)
 }
 
 // Register mounts the web UI routes on the supplied mux.
@@ -25,6 +26,7 @@ func (h *webUIHandler) Register(mux *http.ServeMux) {
 // StatusResponse is the JSON structure returned by GET /api/status.
 type StatusResponse struct {
 	CollectedAt time.Time           `json:"collected_at"`
+	ExitRegion  string              `json:"exit_region"` // TOR_EXIT_REGION value; empty = worldwide
 	Tunnels     []TunnelStatusEntry `json:"tunnels"`
 }
 
@@ -54,6 +56,7 @@ func (h *webUIHandler) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	response := StatusResponse{
 		CollectedAt: torStats.CollectedAt,
+		ExitRegion:  h.exitRegion,
 		Tunnels:     make([]TunnelStatusEntry, len(leases)),
 	}
 
@@ -156,6 +159,7 @@ const uiHTML = `<!DOCTYPE html>
   .busy{background:#7c2d12;color:#fca5a5}
   .warming{background:#713f12;color:#fde68a}
   .degraded{background:#1e293b;color:#94a3b8}
+  .region-badge{display:inline-block;padding:.2em .75em;border-radius:999px;font-size:.8rem;font-weight:600;background:#1e3a5f;color:#7dd3fc;margin-left:.75rem;vertical-align:middle}
   .iface{font-family:monospace;font-weight:700;color:#93c5fd}
   .addr{font-family:monospace;color:#a5b4fc}
   .endpoint{font-family:monospace;font-size:.8rem;color:#67e8f9}
@@ -166,7 +170,7 @@ const uiHTML = `<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Tor Proxy <span id="ts"></span></h1>
+<h1>Tor Proxy <span id="ts"></span><span id="region-badge"></span></h1>
 <table>
 <thead><tr>
   <th>Instance</th>
@@ -198,11 +202,23 @@ function ago(ts){
   if(s<3600)return Math.floor(s/60)+'m ago';
   return Math.floor(s/3600)+'h ago';
 }
+const regionLabel={
+  '':'Worldwide','worldwide':'Worldwide',
+  'europe':'Europe','americas':'Americas',
+  'us':'US Only','uk':'UK Only','asia':'Asia'
+};
+function setRegionBadge(r){
+  const el=document.getElementById('region-badge');
+  if(!el)return;
+  const label=regionLabel[r]||(r?r:'Worldwide');
+  el.innerHTML='<span class="region-badge">Exit Region: '+label+'</span>';
+}
 async function refresh(){
   try{
     const r=await fetch('/api/status');
     const d=await r.json();
     document.getElementById('ts').textContent='as of '+new Date(d.collected_at).toLocaleTimeString();
+    setRegionBadge(d.exit_region||'');
     const rows=d.tunnels.map(function(t){
       return '<tr>'+
         '<td><span class="iface">'+t.interface+'</span></td>'+
