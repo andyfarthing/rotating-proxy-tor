@@ -20,6 +20,32 @@ TOR_DATA_DIR="${TOR_DATA_DIR:-/var/lib/tor-instances}"
 TOR_BOOTSTRAP_TIMEOUT="${TOR_BOOTSTRAP_TIMEOUT:-120}"
 MANIFEST_PATH="${MANIFEST_PATH:-/run/tor-proxy/manifest.json}"
 MANIFEST_DIR="$(dirname "$MANIFEST_PATH")"
+TOR_EXIT_REGION="${TOR_EXIT_REGION:-}"
+
+# ---------------------------------------------------------------------------
+# Resolve TOR_EXIT_REGION to a comma-separated list of {CC} country codes.
+# An empty region means worldwide (no restriction).
+# ---------------------------------------------------------------------------
+
+case "$(echo "$TOR_EXIT_REGION" | tr '[:upper:]' '[:lower:'])" in
+    europe)
+        EXIT_NODES="{gb},{de},{fr},{nl},{se},{no},{ch},{at},{be},{dk},{fi},{ie},{es},{pt},{it}" ;;
+    americas)
+        EXIT_NODES="{us},{ca},{mx},{br},{ar}" ;;
+    us)
+        EXIT_NODES="{us}" ;;
+    uk)
+        EXIT_NODES="{gb}" ;;
+    asia)
+        EXIT_NODES="{jp},{sg},{hk},{kr},{tw},{in}" ;;
+    "" | worldwide)
+        EXIT_NODES="" ;;
+    *)
+        log "WARNING: unknown TOR_EXIT_REGION '${TOR_EXIT_REGION}' — defaulting to worldwide"
+        EXIT_NODES="" ;;
+esac
+
+[ -n "$EXIT_NODES" ] && log "Restricting exit nodes to: $EXIT_NODES"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,11 +80,9 @@ while [ "$i" -lt "$TOR_INSTANCES" ]; do
 
     log "Starting tor${i}: SocksPort=${SOCKS_PORT} ControlPort=${CTRL_PORT}"
 
-    # Write a torrc file for this instance.
-    # CookieAuthentication 0 with no HashedControlPassword = null authentication
-    # on the control port.  AUTHENTICATE with no argument is accepted.
-    # (Safe because we bind the control port to 127.0.0.1 only and it is never
-    # exposed outside the container.)
+    # Write a torrc for this instance. CookieAuthentication 0 with no
+    # HashedControlPassword = null auth on the control port (safe because
+    # it only binds to 127.0.0.1 and is never exposed outside the container).
     cat > "${INST_DIR}/torrc" <<EOF
 DataDirectory ${INST_DIR}
 SocksPort 127.0.0.1:${SOCKS_PORT}
@@ -70,6 +94,7 @@ User nobody
 Log notice file ${LOG_FILE}
 # Each instance uses a completely separate data directory → separate guard
 # nodes → different circuits and exit IPs from each other.
+$([ -n "$EXIT_NODES" ] && printf 'ExitNodes %s\nStrictNodes 1' "$EXIT_NODES")
 EOF
 
     # Truncate the log so we can wait cleanly for bootstrap.

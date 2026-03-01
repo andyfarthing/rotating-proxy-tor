@@ -61,6 +61,29 @@ Set your system HTTP proxy to `localhost:8080`.
 | `TOR_DATA_DIR`          | `/var/lib/tor-instances`       | Base directory for per-instance data directories                 |
 | `MANIFEST_PATH`         | `/run/tor-proxy/manifest.json` | Path for the SOCKS address manifest written at startup           |
 | `TOR_CTRL_BASE_PORT`    | `10050`                        | Go proxy: base control port for exit-IP queries (`0` to disable) |
+| `TOR_EXIT_REGION`       | _(empty)_                      | Restrict exit nodes to a region — see table below                |
+
+### Exit node regions
+
+Set `TOR_EXIT_REGION` to one of the following values to restrict which countries Tor uses as exit nodes. Leave empty (the default) for worldwide selection.
+
+| Value       | Exit countries                                             |
+| ----------- | ---------------------------------------------------------- |
+| _(empty)_   | Worldwide — no restriction (default)                       |
+| `worldwide` | Same as empty                                              |
+| `europe`    | GB, DE, FR, NL, SE, NO, CH, AT, BE, DK, FI, IE, ES, PT, IT |
+| `americas`  | US, CA, MX, BR, AR                                         |
+| `us`        | US only                                                    |
+| `uk`        | GB only                                                    |
+| `asia`      | JP, SG, HK, KR, TW, IN                                     |
+
+> **Note:** Choosing a small region (e.g. `us`) reduces the pool of available exit nodes. If Tor cannot find enough exits to build all circuits, some instances may take longer to bootstrap or fail entirely. `europe` and `worldwide` are the most reliable choices.
+
+```yaml
+# docker-compose.yml
+environment:
+  TOR_EXIT_REGION: "europe"
+```
 
 ### Changing the number of instances
 

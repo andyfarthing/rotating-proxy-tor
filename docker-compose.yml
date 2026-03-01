@@ -34,6 +34,9 @@ services:
       # URL of a plain-text IP-echo service used to determine each instance's exit IP.
       # Must be reachable through Tor. Set to empty string to disable exit IP display.
       TOR_IP_CHECK_URL: "https://api.ipify.org"
+      # Restrict exit nodes to a geographic region.
+      # Valid values: europe | americas | us | uk | asia | worldwide (empty = worldwide)
+      TOR_EXIT_REGION: ""
       # Log verbosity: debug | info | warn | error
       LOG_LEVEL: "info"
 
